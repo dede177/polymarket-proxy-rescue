@@ -1,0 +1,2 @@
+web3>=6
+eth-account>=0.10
