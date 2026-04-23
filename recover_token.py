@@ -20,7 +20,6 @@ Everything else is derived or defaulted:
 - EOA address: derived from private key
 - proxy address: derived from EOA
 - token checked: Polygon Native USDC
-- recovery destination: 0x8e61599CE494E59C5089EE27b6C7Cd08B4150de6
 - RPC: POLYMARKET_RPC_URL or the built-in Polygon RPC default
 
 The recovery transaction calls the Polymarket proxy factory. If the proxy has not
