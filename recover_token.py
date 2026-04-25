@@ -74,7 +74,9 @@ CHAIN_ID = 137
 CHAIN_NAME = "Polygon mainnet"
 NATIVE_GAS_SYMBOL = "POL"
 DEFAULT_RPC_URL = "https://polygon.drpc.org"
-DEFAULT_NATIVE_USDC = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+USDC_E_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"  # PoS-bridged USDC.e (used by Polymarket)
+NATIVE_USDC_ADDRESS = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"  # Circle-native USDC on Polygon
+DEFAULT_TOKENS = [USDC_E_ADDRESS, NATIVE_USDC_ADDRESS]
 
 # Must match polymarket-client-sdk 0.4.x derivation used by this CLI.
 PROXY_FACTORY = "0xaB45c5A4B0c941a2F231C04C3f49182e1A254052"
@@ -139,6 +141,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--token",
+        action="append",
         help=argparse.SUPPRESS,
     )
     parser.add_argument("--rpc", help=argparse.SUPPRESS)
@@ -151,8 +154,8 @@ def banner() -> None:
     print("────────────────────────────────")
     print("Inputs: --wallet-file (JSON, format of `polymarket wallet show --output json`)")
     print("        and a private key (read from the wallet file's config_path or prompted).")
-    print("Default token checked: Polygon Native USDC.")
-    print("Proxy-held tokens are recovered to the EOA from the wallet file.")
+    print("Default tokens checked: Polygon USDC.e (bridged) and native USDC.")
+    print("Proxy-held tokens are recovered to the EOA from the wallet file in a single batched tx.")
     print()
 
 
@@ -266,40 +269,51 @@ def erc20_transfer_calldata(to_addr: str, raw_amount: int) -> str:
     return "a9059cbb" + address_word(to_addr) + word(raw_amount)
 
 
-def proxy_recovery_calldata(token_addr: str, to_addr: str, raw_amount: int) -> str:
+def proxy_recovery_calldata(to_addr: str, transfers: list[tuple[str, int]]) -> str:
     """Encode the reverse-engineered Polymarket proxy factory batch call.
 
     Selector 0x34ee9791 accepts an array of call actions. Action operation 1 is CALL:
       (operation=1, target=token, value=0, data=ERC20.transfer(to, amount))
 
-    When sent to the proxy factory from the EOA, the factory resolves/deploys that
-    EOA's deterministic proxy and executes the action through it.
+    Each entry in `transfers` is (token_addr, raw_amount). All transfers go to
+    the same `to_addr`. When sent to the proxy factory from the EOA, the factory
+    resolves/deploys that EOA's deterministic proxy and executes each action.
     """
-    transfer = erc20_transfer_calldata(to_addr, raw_amount)
+    n = len(transfers)
+    if n == 0:
+        raise ValueError("at least one transfer is required")
 
     # ABI encoding for one argument:
     #   tuple(uint256 operation, address target, uint256 value, bytes data)[]
-    encoded_actions = (
-        word(32)          # offset to array
-        + word(1)         # array length
-        + word(32)        # offset to first dynamic tuple
-        + word(1)         # operation: CALL
-        + address_word(token_addr)
-        + word(0)         # native value
-        + word(128)       # offset to bytes data inside tuple
-        + encode_bytes(transfer)
-    )
-    return "0x34ee9791" + encoded_actions
+    # Each tuple is dynamic (contains bytes), so the array head holds N offsets
+    # into the tail. Each tuple is 256 bytes: 4-word head + 128-byte encoded transfer.
+    head_size = 32 * n
+    tuple_size = 256
+
+    encoded = word(32) + word(n)
+    for i in range(n):
+        encoded += word(head_size + tuple_size * i)
+
+    for token_addr, raw_amount in transfers:
+        transfer = erc20_transfer_calldata(to_addr, raw_amount)
+        encoded += (
+            word(1)                      # operation: CALL
+            + address_word(token_addr)
+            + word(0)                    # native value
+            + word(128)                  # offset to bytes data inside tuple
+            + encode_bytes(transfer)
+        )
+
+    return "0x34ee9791" + encoded
 
 
 def build_proxy_recovery_tx(
     w3: Web3,
     from_addr: str,
-    token_addr: str,
     to_addr: str,
-    raw_amount: int,
+    transfers: list[tuple[str, int]],
 ) -> dict[str, Any]:
-    data = proxy_recovery_calldata(token_addr, to_addr, raw_amount)
+    data = proxy_recovery_calldata(to_addr, transfers)
 
     tx = {
         "from": from_addr,
@@ -326,28 +340,25 @@ def build_proxy_recovery_tx(
 
 
 def print_summary(
-    token_addr: str,
-    symbol: str,
-    decimals: int,
     eoa: str,
     proxy: str,
-    eoa_balance: int,
-    proxy_balance: int,
     proxy_deployed: bool,
     native_balance_wei: int,
+    token_infos: list[dict[str, Any]],
 ) -> None:
     print("\nWallets")
     print(f"  EOA:          {eoa}")
     print(f"  Proxy:        {proxy}")
     print(f"  Proxy code:   {'deployed' if proxy_deployed else 'not deployed'}")
-    print("\nToken")
-    print(f"  Contract:     {token_addr}")
-    print(f"  Symbol:       {symbol}")
-    print(f"  Decimals:     {decimals}")
-    print("\nBalances")
-    print(f"  EOA token:    {human_amount(eoa_balance, decimals)} {symbol}")
-    print(f"  Proxy token:  {human_amount(proxy_balance, decimals)} {symbol}")
-    print(f"  EOA {NATIVE_GAS_SYMBOL}:    {Web3.from_wei(native_balance_wei, 'ether')} {NATIVE_GAS_SYMBOL}")
+    print(f"  EOA {NATIVE_GAS_SYMBOL}:       {Web3.from_wei(native_balance_wei, 'ether')} {NATIVE_GAS_SYMBOL}")
+
+    print("\nTokens")
+    for info in token_infos:
+        symbol = info["symbol"]
+        decimals = info["decimals"]
+        print(f"  {symbol} ({info['address']})")
+        print(f"    EOA balance:    {human_amount(info['eoa_balance'], decimals)} {symbol}")
+        print(f"    Proxy balance:  {human_amount(info['proxy_balance'], decimals)} {symbol}")
 
 
 def main() -> int:
@@ -400,60 +411,63 @@ def main() -> int:
         )
     print("  ✓ Private key matches wallet file EOA")
 
-    print("\nStep 3/3: Connect, scan, and recover Native USDC")
+    print("\nStep 3/3: Connect, scan, and recover ERC-20 balances")
     rpc_url = args.rpc or os.environ.get("POLYMARKET_RPC_URL", DEFAULT_RPC_URL)
     w3 = Web3(Web3.HTTPProvider(rpc_url))
     require_chain(w3)
     print(f"  ✓ Connected to {CHAIN_NAME}")
 
-    token_addr = checksum_address(args.token or DEFAULT_NATIVE_USDC, "token")
+    token_addrs_raw = args.token if args.token else DEFAULT_TOKENS
+    token_addrs = [checksum_address(a, "token") for a in token_addrs_raw]
     if args.token:
-        print(f"  Token override: {token_addr}")
+        print(f"  Token override: {', '.join(token_addrs)}")
     else:
-        print(f"  Token: USDC ({token_addr})")
+        print(f"  Tokens: USDC.e + native USDC ({len(token_addrs)} contracts)")
 
-    token = w3.eth.contract(address=token_addr, abi=ERC20_ABI)
-    decimals = int(call_or_default(token.functions.decimals, 18))
-    symbol = str(call_or_default(token.functions.symbol, "TOKEN"))
-
-    eoa_balance = int(token.functions.balanceOf(eoa).call())
-    proxy_balance = int(token.functions.balanceOf(proxy).call())
     proxy_deployed = len(w3.eth.get_code(proxy)) > 0
     native_balance = int(w3.eth.get_balance(eoa))
 
-    print_summary(
-        token_addr,
-        symbol,
-        decimals,
-        eoa,
-        proxy,
-        eoa_balance,
-        proxy_balance,
-        proxy_deployed,
-        native_balance,
-    )
+    token_infos: list[dict[str, Any]] = []
+    for addr in token_addrs:
+        contract = w3.eth.contract(address=addr, abi=ERC20_ABI)
+        decimals = int(call_or_default(contract.functions.decimals, 18))
+        symbol = str(call_or_default(contract.functions.symbol, "TOKEN"))
+        eoa_balance = int(contract.functions.balanceOf(eoa).call())
+        proxy_balance = int(contract.functions.balanceOf(proxy).call())
+        token_infos.append({
+            "address": addr,
+            "symbol": symbol,
+            "decimals": decimals,
+            "eoa_balance": eoa_balance,
+            "proxy_balance": proxy_balance,
+        })
 
-    if proxy_balance == 0:
+    print_summary(eoa, proxy, proxy_deployed, native_balance, token_infos)
+
+    recoverable = [t for t in token_infos if t["proxy_balance"] > 0]
+    if not recoverable:
         print("\nNo proxy token balance to recover.")
-        if eoa_balance > 0:
+        if any(t["eoa_balance"] > 0 for t in token_infos):
             print("EOA already holds token balance controlled by this private key.")
         return 0
 
-    print("\nProxy token balance detected")
+    print(f"\nProxy holds recoverable balance for {len(recoverable)} token(s)")
     if not proxy_deployed:
         print("  Proxy code is not deployed yet; the recovery transaction will deploy it first.")
 
     destination = eoa
     print(f"  Recovery destination: {destination} (EOA from wallet file)")
 
-    raw_amount = proxy_balance
-    pretty_amount = human_amount(raw_amount, decimals)
-
+    transfers: list[tuple[str, int]] = []
     print("\nProxy recovery transaction")
-    print(f"  Amount:       {pretty_amount} {symbol}")
+    for info in recoverable:
+        amount = info["proxy_balance"]
+        pretty = human_amount(amount, info["decimals"])
+        print(f"  {pretty} {info['symbol']} from {info['address']}")
+        transfers.append((info["address"], amount))
     print(f"  Destination:  {destination}")
 
-    tx = build_proxy_recovery_tx(w3, eoa, token_addr, destination, raw_amount)
+    tx = build_proxy_recovery_tx(w3, eoa, destination, transfers)
     estimated_fee = tx["gas"] * tx["gasPrice"]
     print(f"  Gas estimate: {tx['gas']}")
     print(f"  Gas price:    {Web3.from_wei(tx['gasPrice'], 'gwei')} gwei")
