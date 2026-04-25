@@ -3,33 +3,37 @@
 Diagnose and recover ERC-20 tokens sent to a Polymarket proxy wallet.
 
 Safety model:
-- Private key is prompted with getpass; it is never read from env/config and never accepted as a CLI arg.
-- Proxy-held Native USDC is recovered to the fixed Polygon destination address baked into this script.
-- The script simulates and estimates gas, then broadcasts automatically.
+- EOA and proxy addresses are read from a JSON wallet file whose format matches
+  `polymarket wallet show --output json` (fields: `address`, `proxy_address`,
+  optional `config_path`).
+- Private key is loaded from the wallet file's `config_path` (a polymarket CLI
+  config containing `private_key`) when present; otherwise it is prompted via
+  getpass. It is never accepted as a CLI arg or environment variable.
+- Proxy-held Native USDC is recovered to the EOA from the wallet file.
+- The script simulates and estimates gas, then prompts for confirmation before broadcasting.
 
 Dependencies:
     python -m pip install web3 eth-account
 
 Run:
-    python scripts/recover_token.py
+    python recover_token.py --wallet-file wallet.json
 
-Default mode prompts for:
-- your private key
+You can produce the wallet file with:
+    polymarket wallet show --output json > wallet.json
 
-Everything else is derived or defaulted:
-- EOA address: derived from private key
-- proxy address: derived from EOA
+Defaults:
 - token checked: Polygon Native USDC
 - RPC: POLYMARKET_RPC_URL or the built-in Polygon RPC default
 
 The recovery transaction calls the Polymarket proxy factory. If the proxy has not
 been deployed yet, the factory deploys it and transfers the proxy's token balance
-to the fixed destination address in the same transaction.
+to the destination in the same transaction.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from decimal import Decimal, getcontext
@@ -66,10 +70,11 @@ def import_deps() -> None:
     to_checksum_address = _to_checksum_address
 
 
-POLYGON_CHAIN_ID = 137
+CHAIN_ID = 137
+CHAIN_NAME = "Polygon mainnet"
+NATIVE_GAS_SYMBOL = "POL"
 DEFAULT_RPC_URL = "https://polygon.drpc.org"
-DEFAULT_NATIVE_USDC = "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359"
-DEFAULT_DESTINATION = "0x8e61599CE494E59C5089EE27b6C7Cd08B4150de6"
+DEFAULT_NATIVE_USDC = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
 
 # Must match polymarket-client-sdk 0.4.x derivation used by this CLI.
 PROXY_FACTORY = "0xaB45c5A4B0c941a2F231C04C3f49182e1A254052"
@@ -121,7 +126,16 @@ ERC20_ABI: list[dict[str, Any]] = [
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Private-key-only Polymarket proxy Native USDC recovery wizard."
+        description="Polymarket proxy Native USDC recovery wizard."
+    )
+    parser.add_argument(
+        "--wallet-file",
+        required=True,
+        help=(
+            "Path to a JSON wallet file matching `polymarket wallet show --output json`. "
+            "Required fields: `address`, `proxy_address`. Optional: `config_path` (a "
+            "polymarket CLI config file containing `private_key`)."
+        ),
     )
     parser.add_argument(
         "--token",
@@ -135,11 +149,10 @@ def banner() -> None:
     print()
     print("Polymarket ERC-20 Recovery Wizard")
     print("────────────────────────────────")
-    print("Required input: your private key. The recovery address is fixed.")
-    print("This checks both your EOA and derived Polymarket proxy wallet.")
+    print("Inputs: --wallet-file (JSON, format of `polymarket wallet show --output json`)")
+    print("        and a private key (read from the wallet file's config_path or prompted).")
     print("Default token checked: Polygon Native USDC.")
-    print("Proxy-held tokens are recovered to the fixed destination baked into this script.")
-    print("If recovery is possible, the transaction is sent automatically.")
+    print("Proxy-held tokens are recovered to the EOA from the wallet file.")
     print()
 
 
@@ -148,6 +161,57 @@ def checksum_address(raw: str, label: str) -> str:
         return to_checksum_address(raw)
     except ValueError as exc:
         raise SystemExit(f"Invalid {label} address: {raw}") from exc
+
+
+def load_wallet_file(path: str) -> tuple[str, str, str | None]:
+    """Read EOA, proxy, and optional config_path from a `polymarket wallet show` JSON file."""
+    try:
+        with open(path) as fh:
+            data = json.load(fh)
+    except OSError as exc:
+        raise SystemExit(f"Could not read wallet file {path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"Wallet file {path} is not valid JSON: {exc}") from exc
+
+    if not isinstance(data, dict):
+        raise SystemExit(f"Wallet file {path} must be a JSON object")
+
+    eoa_raw = data.get("address")
+    proxy_raw = data.get("proxy_address")
+    if not eoa_raw:
+        raise SystemExit(f"Wallet file {path} missing required field `address`")
+    if not proxy_raw:
+        raise SystemExit(f"Wallet file {path} missing required field `proxy_address`")
+
+    eoa = checksum_address(eoa_raw, "wallet file `address`")
+    proxy = checksum_address(proxy_raw, "wallet file `proxy_address`")
+    config_path = data.get("config_path")
+    if config_path is not None and not isinstance(config_path, str):
+        raise SystemExit(f"Wallet file {path} has non-string `config_path`")
+    return eoa, proxy, config_path or None
+
+
+def load_private_key_from_config(config_path: str) -> str | None:
+    """Return the `private_key` field from a polymarket CLI config file, or None if absent."""
+    try:
+        with open(config_path) as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise SystemExit(f"Could not read config file {config_path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"Config file {config_path} is not valid JSON: {exc}") from exc
+
+    if not isinstance(data, dict):
+        raise SystemExit(f"Config file {config_path} must be a JSON object")
+
+    key = data.get("private_key")
+    if key is None:
+        return None
+    if not isinstance(key, str) or not key.strip():
+        raise SystemExit(f"Config file {config_path} has invalid `private_key`")
+    return key.strip()
 
 
 def derive_proxy_wallet(eoa_address: str) -> str:
@@ -159,13 +223,13 @@ def derive_proxy_wallet(eoa_address: str) -> str:
     return to_checksum_address(digest[-20:])
 
 
-def require_polygon(w3: Web3) -> None:
+def require_chain(w3: Web3) -> None:
     try:
         chain_id = w3.eth.chain_id
     except Exception as exc:  # noqa: BLE001 - display RPC failure clearly
         raise SystemExit(f"Could not connect to RPC: {exc}") from exc
-    if chain_id != POLYGON_CHAIN_ID:
-        raise SystemExit(f"RPC chain id is {chain_id}, expected Polygon mainnet {POLYGON_CHAIN_ID}")
+    if chain_id != CHAIN_ID:
+        raise SystemExit(f"RPC chain id is {chain_id}, expected {CHAIN_NAME} {CHAIN_ID}")
 
 
 def call_or_default(fn: Any, default: Any) -> Any:
@@ -242,7 +306,7 @@ def build_proxy_recovery_tx(
         "to": checksum_address(PROXY_FACTORY, "proxy factory"),
         "data": data,
         "nonce": w3.eth.get_transaction_count(from_addr),
-        "chainId": POLYGON_CHAIN_ID,
+        "chainId": CHAIN_ID,
         "value": 0,
     }
 
@@ -283,7 +347,7 @@ def print_summary(
     print("\nBalances")
     print(f"  EOA token:    {human_amount(eoa_balance, decimals)} {symbol}")
     print(f"  Proxy token:  {human_amount(proxy_balance, decimals)} {symbol}")
-    print(f"  EOA MATIC:    {Web3.from_wei(native_balance_wei, 'ether')} MATIC")
+    print(f"  EOA {NATIVE_GAS_SYMBOL}:    {Web3.from_wei(native_balance_wei, 'ether')} {NATIVE_GAS_SYMBOL}")
 
 
 def main() -> int:
@@ -292,11 +356,34 @@ def main() -> int:
 
     banner()
 
-    print("Step 1/3: Enter the private key")
-    print("  The key is hidden as you type and is not saved.")
-    private_key = getpass("Enter private key: ").strip()
+    print("Step 1/3: Load wallet file")
+    eoa, proxy, config_path = load_wallet_file(args.wallet_file)
+    print(f"  Wallet file: {args.wallet_file}")
+    print(f"  EOA:   {eoa}")
+    print(f"  Proxy: {proxy}")
+
+    derived_proxy = derive_proxy_wallet(eoa)
+    if derived_proxy != proxy:
+        raise SystemExit(
+            f"Wallet file `proxy_address` {proxy} does not match the proxy derived "
+            f"from `address`: expected {derived_proxy}. Refusing to continue."
+        )
+
+    print("\nStep 2/3: Load private key")
+    private_key: str | None = None
+    if config_path:
+        private_key = load_private_key_from_config(config_path)
+        if private_key:
+            print(f"  ✓ Private key loaded from config_path: {config_path}")
+        else:
+            print(f"  config_path {config_path} has no `private_key`; falling back to prompt.")
+
     if not private_key:
-        raise SystemExit("Private key is required")
+        print("  The key is hidden as you type and is not saved.")
+        private_key = getpass("  Enter private key: ").strip()
+        if not private_key:
+            raise SystemExit("Private key is required")
+
     if not private_key.startswith("0x"):
         private_key = "0x" + private_key
 
@@ -305,25 +392,25 @@ def main() -> int:
     except Exception as exc:  # noqa: BLE001
         raise SystemExit(f"Invalid private key: {exc}") from exc
 
-    print("\nStep 2/3: Derive wallet addresses")
-    eoa = to_checksum_address(account.address)
-    proxy = derive_proxy_wallet(eoa)
-
-    print("  ✓ Wallet loaded")
-    print(f"  EOA:   {eoa}")
-    print(f"  Proxy: {proxy}")
+    derived_eoa = to_checksum_address(account.address)
+    if derived_eoa != eoa:
+        raise SystemExit(
+            f"Private key controls EOA {derived_eoa}, but wallet file specifies {eoa}. "
+            "Refusing to continue."
+        )
+    print("  ✓ Private key matches wallet file EOA")
 
     print("\nStep 3/3: Connect, scan, and recover Native USDC")
     rpc_url = args.rpc or os.environ.get("POLYMARKET_RPC_URL", DEFAULT_RPC_URL)
     w3 = Web3(Web3.HTTPProvider(rpc_url))
-    require_polygon(w3)
-    print("  ✓ Connected to Polygon mainnet")
+    require_chain(w3)
+    print(f"  ✓ Connected to {CHAIN_NAME}")
 
     token_addr = checksum_address(args.token or DEFAULT_NATIVE_USDC, "token")
     if args.token:
         print(f"  Token override: {token_addr}")
     else:
-        print(f"  Token: Polygon Native USDC ({token_addr})")
+        print(f"  Token: USDC ({token_addr})")
 
     token = w3.eth.contract(address=token_addr, abi=ERC20_ABI)
     decimals = int(call_or_default(token.functions.decimals, 18))
@@ -356,8 +443,8 @@ def main() -> int:
     if not proxy_deployed:
         print("  Proxy code is not deployed yet; the recovery transaction will deploy it first.")
 
-    destination = checksum_address(DEFAULT_DESTINATION, "default destination")
-    print(f"  Recovery destination: {destination}")
+    destination = eoa
+    print(f"  Recovery destination: {destination} (EOA from wallet file)")
 
     raw_amount = proxy_balance
     pretty_amount = human_amount(raw_amount, decimals)
@@ -370,15 +457,18 @@ def main() -> int:
     estimated_fee = tx["gas"] * tx["gasPrice"]
     print(f"  Gas estimate: {tx['gas']}")
     print(f"  Gas price:    {Web3.from_wei(tx['gasPrice'], 'gwei')} gwei")
-    print(f"  Max fee:      {Web3.from_wei(estimated_fee, 'ether')} MATIC")
+    print(f"  Max fee:      {Web3.from_wei(estimated_fee, 'ether')} {NATIVE_GAS_SYMBOL}")
 
     if native_balance < estimated_fee:
         raise SystemExit(
-            "Insufficient MATIC on EOA for gas: "
-            f"need up to {Web3.from_wei(estimated_fee, 'ether')} MATIC"
+            f"Insufficient {NATIVE_GAS_SYMBOL} on EOA for gas: "
+            f"need up to {Web3.from_wei(estimated_fee, 'ether')} {NATIVE_GAS_SYMBOL}"
         )
 
-    print("  Broadcast:    automatic")
+    answer = input("\nBroadcast this transaction? [y/N]: ").strip().lower()
+    if answer not in ("y", "yes"):
+        raise SystemExit("Aborted by user; no transaction sent.")
+
     print("\nBroadcasting proxy recovery transaction...")
 
     signed = Account.sign_transaction(tx, private_key)
